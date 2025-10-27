@@ -1,0 +1,24 @@
+# .github/workflows/build-cpy.yml
+name: Build CPython Tool
+on:
+  workflow_call:
+    inputs:
+      version: {required: true, default: "3.12.7"}
+      fips: {type: boolean, default: false}
+    secrets: inherit
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Conan
+        uses: conan-io/setup-conan@v1
+        with: {conan_version: 2.21.0}
+      - name: Create Package
+        run: conan create . ${{ inputs.version }} -o fips=${{ inputs.fips }} --build=missing
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpy-${{ inputs.version }}
+          path: build/
