@@ -1,24 +1,71 @@
-# .github/workflows/build-cpy.yml
-name: Build CPython Tool
+# .github/workflows/build-openssl.yml
+name: Build OpenSSL
 on:
   workflow_call:
     inputs:
-      version: {required: true, default: "3.12.7"}
-      fips: {type: boolean, default: false}
-    secrets: inherit
+      version:
+        description: OpenSSL version
+        required: true
+        type: string
+        default: "3.4.0"
+      platform:
+        description: Runner platform
+        required: true
+        type: string
+        default: "ubuntu-latest"
+      fips:
+        description: Enable FIPS
+        required: false
+        type: boolean
+        default: false
+      enable-sbom:
+        description: Generate SBOM
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      artifact-url:
+        description: Built artifact URL
+        value: ${{ jobs.build.outputs.artifact-url }}
+      sbom-generated:
+        value: ${{ jobs.build.outputs.sbom-generated }}
+    secrets:
+      CLOUDSMITH_API_KEY:
+        required: false
+      inherits: inherit  # Pass org secrets [web:27]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.platform }}
+    outputs:
+      artifact-url: ${{ steps.upload.outputs.artifact-url }}
+      sbom-generated: ${{ steps.sbom.outputs.sbom-generated }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4  # Secure checkout [web:15]
       - name: Setup Conan
         uses: conan-io/setup-conan@v1
-        with: {conan_version: 2.21.0}
-      - name: Create Package
-        run: conan create . ${{ inputs.version }} -o fips=${{ inputs.fips }} --build=missing
+        with:
+          conan_version: 2.21.0  # Pinned [file:35]
+      - name: Bootstrap
+        run: python openssl-conan-init.py  # Stdlib only [user-information]
+      - name: Build with Conan
+        run: |
+          conan create . ${{ inputs.version }} -pr=openssl-profiles/default -o fips=${{ inputs.fips }}
+          # Security: Fail on build errors
+          if [ $? -ne 0 ]; then exit 1; fi
+      - if: inputs.enable-sbom
+        name: Generate SBOM
+        id: sbom
+        uses: anchore/sbom-action@v0.16.1  # Syft [file:36]
+        with:
+          image: false  # Filesystem scan
+          format: cyclonedx
+          output-file: sbom.json
+        continue-on-error: false  # Block on failure
       - name: Upload Artifact
+        id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: cpy-${{ inputs.version }}
+          name: openssl-${{ inputs.version }}
           path: build/
+      # @cursor: Validate build output; spawn agent for PR review if anomalies detected [file:35]
