@@ -1,0 +1,344 @@
+name: Build CPython Multi-Platform Matrix
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: 'CPython version to build'
+        required: true
+        default: '3.12.7'
+        type: string
+      fips_enabled:
+        description: 'Enable FIPS 140-3 compliance'
+        type: boolean
+        default: true
+      skip_security_scan:
+        description: 'Skip security scanning (emergency only)'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+  schedule:
+    # Rebuild monthly for security updates
+    - cron: '0 2 1 * *'
+
+env:
+  CONAN_VERSION: "2.21.0"
+  CLOUDSMITH_REPO: "sparesparrow-conan/openssl-conan"
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Generate Build Matrix
+        id: matrix
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pythonVersion = '${{ inputs.python_version || '3.12.7' }}';
+            const fipsEnabled = ${{ inputs.fips_enabled || true }};
+            
+            const matrix = {
+              include: [
+                {
+                  os: 'ubuntu-latest',
+                  platform: 'linux-x86_64',
+                  conan_profile: 'linux-x86_64',
+                  python_configure_args: '--enable-optimizations --with-lto --enable-shared',
+                  archive_format: 'tar.gz',
+                  python_bin: 'bin/python3'
+                },
+                {
+                  os: 'ubuntu-latest', 
+                  platform: 'linux-aarch64',
+                  conan_profile: 'linux-aarch64',
+                  python_configure_args: '--enable-optimizations --enable-shared --host=aarch64-linux-gnu',
+                  archive_format: 'tar.gz',
+                  python_bin: 'bin/python3'
+                },
+                {
+                  os: 'macos-latest',
+                  platform: 'macos-x86_64', 
+                  conan_profile: 'macos-x86_64',
+                  python_configure_args: '--enable-optimizations --with-lto --enable-framework',
+                  archive_format: 'tar.gz',
+                  python_bin: 'bin/python3'
+                },
+                {
+                  os: 'macos-14', // Apple Silicon
+                  platform: 'macos-arm64',
+                  conan_profile: 'macos-arm64', 
+                  python_configure_args: '--enable-optimizations --enable-framework',
+                  archive_format: 'tar.gz',
+                  python_bin: 'bin/python3'
+                },
+                {
+                  os: 'windows-latest',
+                  platform: 'windows-x86_64',
+                  conan_profile: 'windows-x86_64',
+                  python_configure_args: '',
+                  archive_format: 'zip',
+                  python_bin: 'python.exe'
+                }
+              ]
+            };
+            
+            // Add version and FIPS flags to each entry
+            matrix.include = matrix.include.map(entry => ({
+              ...entry,
+              python_version: pythonVersion,
+              fips_enabled: fipsEnabled,
+              package_name: `cpython-tool-${pythonVersion}-${entry.platform}`
+            }));
+            
+            return matrix;
+
+  security-scan-source:
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_security_scan }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      # @security CodeQL Analysis
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        
+      # @security Source SBOM
+      - name: Generate Source SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: source-sbom.cyclonedx.json
+          
+      - name: Upload Source SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-sbom
+          path: source-sbom.cyclonedx.json
+
+  build-cpython:
+    needs: [generate-matrix, security-scan-source]
+    if: always() && (needs.security-scan-source.result == 'success' || inputs.skip_security_scan)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+      
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Conan
+        uses: conan-io/setup-conan@v1
+        with:
+          version: ${{ env.CONAN_VERSION }}
+          
+      - name: Install Platform Dependencies
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential libbz2-dev libdb-dev \
+              libreadline-dev libffi-dev libgdbm-dev liblzma-dev \
+              libncursesw5-dev libssl-dev libsqlite3-dev tk-dev \
+              uuid-dev zlib1g-dev
+            if [[ "${{ matrix.platform }}" == "linux-aarch64" ]]; then
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+            fi
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            brew install openssl readline sqlite3 xz zlib tcl-tk
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            # Dependencies handled by conanfile.py
+            echo "Windows dependencies managed by Conan"
+          fi
+        shell: bash
+        
+      - name: Configure Conan Profile
+        run: |
+          conan profile detect --force
+          if [[ -f "profiles/${{ matrix.conan_profile }}" ]]; then
+            cp "profiles/${{ matrix.conan_profile }}" "$(conan profile path default)"
+          fi
+        shell: bash
+        
+      - name: Build CPython with Conan
+        env:
+          FIPS_ENABLED: ${{ matrix.fips_enabled }}
+          PYTHON_CONFIGURE_ARGS: ${{ matrix.python_configure_args }}
+        run: |
+          conan create . cpython-tool/${{ matrix.python_version }}@ \
+            --build=missing \
+            -o fips=${{ matrix.fips_enabled }} \
+            -o configure_args="${{ matrix.python_configure_args }}" \
+            -pr:b=default -pr:h=default
+        shell: bash
+        
+      - name: Package CPython Tool
+        id: package
+        run: |
+          # Export built package to local directory
+          conan export-pkg . cpython-tool/${{ matrix.python_version }}@ \
+            --package-folder=./package_export
+            
+          # Create distributable package
+          PACKAGE_NAME="${{ matrix.package_name }}"
+          
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            powershell -Command "Compress-Archive -Path './package_export/*' -DestinationPath '${PACKAGE_NAME}.zip'"
+            echo "package_file=${PACKAGE_NAME}.zip" >> $GITHUB_OUTPUT
+          else
+            tar -czf "${PACKAGE_NAME}.tar.gz" -C package_export .
+            echo "package_file=${PACKAGE_NAME}.tar.gz" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
+        shell: bash
+        
+      # @security Binary SBOM Generation
+      - name: Generate Binary SBOM
+        if: ${{ !inputs.skip_security_scan }}
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./package_export
+          format: cyclonedx-json
+          output-file: ${{ matrix.package_name }}-sbom.cyclonedx.json
+          
+      # @security Trivy Security Scan
+      - name: Trivy Binary Scan
+        if: ${{ !inputs.skip_security_scan }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './package_export'
+          format: 'sarif'
+          output: '${{ matrix.package_name }}-trivy.sarif'
+          exit-code: '1' # Block on CRITICAL findings
+          severity: 'CRITICAL,HIGH'
+          
+      - name: Upload Security Artifacts
+        if: ${{ !inputs.skip_security_scan }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-${{ matrix.platform }}
+          path: |
+            ${{ matrix.package_name }}-sbom.cyclonedx.json
+            ${{ matrix.package_name }}-trivy.sarif
+            
+      - name: Upload CPython Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package_name }}
+          path: ${{ steps.package.outputs.package_file }}
+          retention-days: 30
+
+  publish-cloudsmith:
+    needs: [build-cpython]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+      
+    steps:
+      - name: Download Package Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.package_name }}
+          
+      - name: Install Cloudsmith CLI
+        run: pip install cloudsmith-cli
+        
+      - name: Publish to Cloudsmith
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+        run: |
+          PACKAGE_FILE="${{ matrix.package_name }}.${{ matrix.archive_format }}"
+          
+          # Upload to Cloudsmith raw repository
+          cloudsmith push raw ${{ env.CLOUDSMITH_REPO }} \
+            "${PACKAGE_FILE}" \
+            --name "cpython-tool" \
+            --version "${{ matrix.python_version }}" \
+            --summary "Prebuilt CPython ${{ matrix.python_version }} for ${{ matrix.platform }}" \
+            --description "Security-hardened CPython build with FIPS compliance for OpenSSL DevOps automation" \
+            --tags "cpython,bootstrap,fips,openssl"
+
+  validate-packages:
+    needs: [build-cpython]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: 
+        platform: [linux-x86_64, macos-x86_64, macos-arm64, windows-x86_64]
+        
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download Package
+        uses: actions/download-artifact@v4
+        with:
+          name: cpython-tool-${{ inputs.python_version || '3.12.7' }}-${{ matrix.platform }}
+          
+      - name: Validate Package Structure
+        run: |
+          PYTHON_VERSION="${{ inputs.python_version || '3.12.7' }}"
+          PACKAGE_NAME="cpython-tool-${PYTHON_VERSION}-${{ matrix.platform }}"
+          
+          if [[ "${{ matrix.platform }}" == "windows-x86_64" ]]; then
+            unzip "${PACKAGE_NAME}.zip" -d extracted/
+          else
+            tar -xzf "${PACKAGE_NAME}.tar.gz" -C extracted/
+          fi
+          
+          # Validate essential files exist
+          echo "Validating package structure..."
+          
+          if [[ "${{ matrix.platform }}" == "windows-x86_64" ]]; then
+            test -f extracted/python.exe
+            test -f extracted/Scripts/pip.exe
+          else
+            test -f extracted/bin/python3
+            test -f extracted/bin/pip3
+            test -d extracted/lib
+          fi
+          
+          echo "✓ Package structure validation passed"
+          
+      # @cursor PR Comment: Package validation results
+      - name: Comment Validation Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ CPython package validation passed for ${{ matrix.platform }}'
+            });
+
+  # @cursor: Spawn agent for comprehensive testing if all builds succeed
+  integration-test:
+    needs: [build-cpython, validate-packages]
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sparesparrow/openssl-test
+          path: openssl-test
+          
+      - name: Test Bootstrap Integration
+        run: |
+          cd openssl-test
+          # Test bootstrap with locally built CPython packages
+          python3 tests/test_bootstrap_integration.py \
+            --cpython-source=local \
+            --cpython-version=${{ inputs.python_version || '3.12.7' }}
